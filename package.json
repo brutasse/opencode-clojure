@@ -1,0 +1,19 @@
+{
+  "name": "opencode-clojure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode plugin: auto-repair Clojure delimiter errors on write/edit/patch + in-process nREPL eval tool (self-contained: embedded parinfer, optional cljfmt)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit --strict --allowImportingTsExtensions --target es2022 --module nodenext --moduleResolution nodenext --skipLibCheck --types node index.ts parinfer.d.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.8",
+    "parinfer": "^3.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.9.3"
+  }
+}
