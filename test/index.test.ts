@@ -11,6 +11,13 @@ import plugin, {
   handleBefore,
   handleAfter,
   hasDelimiterError,
+  scanClojure,
+  describeScanErrors,
+  changedLinesBetween,
+  repairSurgically,
+  MAX_REPAIR_CHANGED_LINES,
+  REPAIR_WINDOW_BEFORE,
+  REPAIR_WINDOW_AFTER,
   repairText,
   formatWithCljfmt,
   resolveCljfmt,
@@ -228,6 +235,186 @@ test("hasDelimiterError: regex literals do not count", () => {
   assert.equal(hasDelimiterError('(def s #"abc( def x 1)")'), false);
   // unterminated regex
   assert.equal(hasDelimiterError('(def r #"\\(x'), true);
+});
+
+// ---------------------------------------------------------------------------
+// scanClojure: the same verdict, plus where the delimiters are wrong
+// ---------------------------------------------------------------------------
+
+test("scanClojure: balanced code reports no errors", () => {
+  for (const text of [
+    "(defn foo [x] (* x 2))",
+    "{:a [1 2] :b #{3 4}}",
+    '(def s "a \\" ( b")',
+    '(def s "line1\nline2 (")',
+    "(def c \\( \\[ \\{ )",
+    '(def r #"abc( def x 1)")',
+    "(def x 1) ; todo: fix (this",
+    "#!/usr/bin/env bb\n(def x 1)",
+    "#{:a #?(:clj 1 :cljs 2)}",
+  ]) {
+    assert.deepEqual(scanClojure(text), [], JSON.stringify(text));
+  }
+});
+
+test("scanClojure: unclosed delimiters are reported outermost first", () => {
+  assert.deepEqual(scanClojure("(defn f []\n  (let [x 1]\n    (inc x)\n"), [
+    { kind: "unclosed", line: 1, col: 1, char: "(" },
+    { kind: "unclosed", line: 2, col: 3, char: "(" },
+  ]);
+  // a badly truncated file reports at most three openers
+  assert.equal(scanClojure("(a\n(b\n(c\n(d\n(e\n").length, 3);
+});
+
+test("scanClojure: closer errors and string errors carry line and column", () => {
+  assert.deepEqual(scanClojure("(def x 1))\n"), [{ kind: "extra-closer", line: 1, col: 10, char: ")" }]);
+  assert.deepEqual(scanClojure("{:a [1 2}"), [
+    { kind: "mismatched-closer", line: 1, col: 9, char: "}", opener: { char: "[", line: 1 } },
+    { kind: "unclosed", line: 1, col: 1, char: "{" },
+  ]);
+  assert.deepEqual(scanClojure("(def a 1)\n(def s \"foo\n"), [
+    { kind: "unterminated-string", line: 2, col: 8, char: '"' },
+    { kind: "unclosed", line: 2, col: 1, char: "(" },
+  ]);
+  assert.deepEqual(scanClojure("(def a 1)\n(def r #\"foo\n"), [
+    { kind: "unterminated-regex", line: 2, col: 8, char: '#"' },
+    { kind: "unclosed", line: 2, col: 1, char: "(" },
+  ]);
+});
+
+test("describeScanErrors: wording an agent can act on", () => {
+  assert.equal(
+    describeScanErrors(scanClojure("(deftest a []\n  (is (= 1 1)\n")),
+    "`(` opened at line 1 is never closed; `(` opened at line 2 is never closed",
+  );
+  assert.equal(describeScanErrors(scanClojure("(def x 1))")), "unexpected `)` at line 1:10");
+});
+
+// ---------------------------------------------------------------------------
+// changedLinesBetween: what a rewrite actually touched
+// ---------------------------------------------------------------------------
+
+test("changedLinesBetween: ignores whitespace and reports changed lines", () => {
+  assert.deepEqual(changedLinesBetween("(a 1)\n(b 2)\n", "(a 1)\n(b 2)\n"), []);
+  assert.deepEqual(changedLinesBetween("(a 1)\n(b 2)\n", "(a 1)\n(b 2 3)\n"), [2]);
+  // reindent alone is not a change
+  assert.deepEqual(changedLinesBetween("(a 1)\n    (b 2)\n", "(a 1)\n  (b 2)\n"), []);
+  assert.deepEqual(changedLinesBetween("(a 1)\n(d 4)\n", "(a 1)\n(b 2)\n(c 3)\n(d 4)\n"), [2, 3]);
+});
+
+// ---------------------------------------------------------------------------
+// repairSurgically: the engine's proposal has to stay next to the error
+// ---------------------------------------------------------------------------
+
+test("repairSurgically: balanced code never reaches the repair engine", async () => {
+  const calls = mockRepair({});
+  assert.deepEqual(await repairSurgically("(defn foo [x] (* x 2))\n"), { status: "clean" });
+  assert.deepEqual(calls, []);
+});
+
+test("repairSurgically: accepts a fix on the error line", async () => {
+  assert.deepEqual(await repairSurgically("(+ 1 2 3"), { status: "repaired", text: "(+ 1 2 3)", rewrote: [1] });
+});
+
+test("repairSurgically: declines a fix that rewrites too many lines", async () => {
+  const broken = ["(a 1)", "", "(b 2", "", "(c 3", "", "(d 4"].join("\n");
+  // one proposal that fixes all three forms at once: 3 lines, cap is 2
+  const fixed = ["(a 1)", "", "(b 2)", "", "(c 3)", "", "(d 4)"].join("\n");
+  mockRepair({ [broken]: { status: "repaired", text: fixed } });
+
+  const declined = await repairSurgically(broken);
+  assert.equal(declined.status, "declined");
+  if (declined.status !== "declined") return;
+  assert.ok(declined.rewrote.length > MAX_REPAIR_CHANGED_LINES, JSON.stringify(declined.rewrote));
+  assert.match(declined.message, /is never closed/);
+  assert.match(declined.message, /more than 2/);
+
+  // the same proposal passes once the cap covers it
+  assert.equal((await repairSurgically(broken, { maxChangedLines: 4 })).status, "repaired");
+});
+
+test("repairSurgically: declines a fix that moves delimiters away from the error", async () => {
+  const broken = ["(a 1)", "", "", "", "", "", "", "", "(b 2"].join("\n");
+  // a legal repair - balanced, and only one closer moved - but the closer it
+  // relocates belongs to a form above the error, which is how indent mode
+  // closes a form early
+  const fixed = ["(a 1", "", "", "", "", "", "", "", "(b 2))"].join("\n");
+  mockRepair({ [broken]: { status: "repaired", text: fixed } });
+
+  const declined = await repairSurgically(broken);
+  assert.equal(declined.status, "declined");
+  if (declined.status !== "declined") return;
+  assert.deepEqual(declined.rewrote, [1, 9]);
+  assert.match(declined.message, /away from the error/);
+
+  // the band is asymmetric: below the error is where a missing closer belongs
+  assert.ok(REPAIR_WINDOW_AFTER > REPAIR_WINDOW_BEFORE);
+  assert.equal((await repairSurgically(broken, { windowBefore: 8 })).status, "repaired");
+});
+
+test("repairSurgically: anchors are the caller's own changed lines", async () => {
+  const broken = ["(a 1)", "", "", "", "", "", "", "", "(b 2"].join("\n");
+  const fixed = ["(a 1", "", "", "", "", "", "", "", "(b 2))"].join("\n");
+  mockRepair({ [broken]: { status: "repaired", text: fixed } });
+  assert.equal((await repairSurgically(broken, { anchors: [1, 2] })).status, "repaired");
+});
+
+test("repairSurgically: a closer that belongs far below its opener is still repaired", async () => {
+  const body = Array.from({ length: 20 }, (_, i) => `  (println ${i})`).join("\n");
+  const whole = `(defn big []\n${body}\n  (inc 1))\n`;
+  const broken = `(defn big []\n${body}\n  (inc 1)\n`;
+  assert.deepEqual(scanClojure(broken), [{ kind: "unclosed", line: 1, col: 1, char: "(" }]);
+
+  const result = await repairSurgically(broken);
+  assert.equal(result.status, "repaired");
+  if (result.status === "repaired") assert.equal(result.text, whole);
+  assert.equal((await repairSurgically(broken, { windowAfter: 5 })).status, "declined");
+});
+
+test("repairSurgically: a proposal that does not fix the code is declined", async () => {
+  const broken = "(+ 1 2 3";
+  mockRepair({ [broken]: { status: "repaired", text: "(+ 1 2 (3" } });
+  const stillBroken = await repairSurgically(broken);
+  assert.equal(stillBroken.status, "declined");
+  if (stillBroken.status === "declined") assert.match(stillBroken.message, /still leave delimiter errors/);
+
+  mockRepair({ [broken]: { status: "repaired", text: broken } });
+  const unchanged = await repairSurgically(broken);
+  assert.equal(unchanged.status, "declined");
+  if (unchanged.status === "declined") assert.match(unchanged.message, /changed nothing/);
+});
+
+test("repairSurgically: engine status is passed through", async () => {
+  const broken = "(+ 1 2 3";
+  mockRepair({ [broken]: { status: "error", message: "engine down" } });
+  assert.deepEqual(await repairSurgically(broken), { status: "error", message: "engine down" });
+
+  mockRepair({ [broken]: { status: "unfixable", message: "unclosed string" } });
+  assert.deepEqual(await repairSurgically(broken), { status: "unfixable", message: "unclosed string" });
+});
+
+test("repairSurgically: real parinfer against indentation drift", async () => {
+  // the file was balanced and badly indented; the model's edit then dropped a
+  // closer. Reading indentation as the truth, parinfer closes the earlier forms
+  // where the indentation says they end, which rewrites unrelated code
+  const drifted = [
+    "(deftest drift-test []", //
+    "(when true", //
+    "(is true)))", //
+    "", //
+    "(deftest new-test []", //
+    '  (is (= 1', //
+    "        (inc 0)))", //
+    "", //
+  ].join("\n");
+  assert.deepEqual(scanClojure(drifted), [{ kind: "unclosed", line: 5, col: 1, char: "(" }]);
+
+  const result = await repairSurgically(drifted, { anchors: [5, 6, 7] });
+  assert.equal(result.status, "declined");
+  if (result.status !== "declined") return;
+  assert.ok(result.rewrote.includes(1), "the drift repair reaches back to line 1");
+  assert.match(result.message, /opened at line 5 is never closed/);
+  assert.match(result.message, /rewrite \d+ lines/);
 });
 
 // ---------------------------------------------------------------------------
@@ -472,6 +659,83 @@ test("edit: unfixable file is restored and the result rewritten", async () => {
   assert.match(resultText(event.result?.content), /retry the edit/);
 });
 
+test("write before: a repair that would move unrelated delimiters rejects the write", async () => {
+  // a balanced, badly indented file plus a missing closer: parinfer would
+  // rewrite the earlier forms to match their indentation instead of fixing the
+  // new form, so the write is refused and nothing reaches disk
+  const content = "(deftest drift-test []\n(when true\n(is true)))\n\n(deftest new-test []\n  (is (= 1\n        (inc 0)))\n";
+  mockFormat();
+  await assert.rejects(
+    () => handleBefore(beforeEvent("write", { path: "drift.clj", content }), sessionDir),
+    (err: unknown) =>
+      err instanceof ToolError &&
+      /were not auto-fixed/.test(err.message) &&
+      /opened at line 5 is never closed/.test(err.message),
+  );
+});
+
+test("edit: a repair that would move unrelated delimiters restores the file", async () => {
+  const before = "(deftest drift-test []\n(when true\n(is true)))\n";
+  const edited = "(deftest drift-test []\n(when true\n(is true)))\n\n(deftest new-test []\n  (is (= 1\n        (inc 0)))\n";
+  const file = path.join(tmp, "drift.clj");
+  writeFileSync(file, before, "utf8");
+  const id = nextID();
+  await handleBefore(beforeEvent("edit", { path: "drift.clj", oldString: "1", newString: "1" }, id), sessionDir);
+  writeFileSync(file, edited, "utf8");
+  mockFormat(); // the real parinfer engine decides
+
+  const event = afterEvent("edit", {}, { content: "Edited!" }, id);
+  await handleAfter(event, sessionDir);
+  assert.equal(readFileSync(file, "utf8"), before, "the pre-edit content is back byte for byte");
+  const message = resultText(event.result?.content);
+  assert.match(message, /was reverted/);
+  assert.match(message, /opened at line 5 is never closed/);
+  assert.match(message, /rewrite 4 lines \(1, 2, 3, 7\)/);
+});
+
+test("edit: the same missing closer in a well-indented file is repaired", async () => {
+  const before = "(deftest a-test []\n  (is (= 1 1)))\n";
+  const edited = "(deftest a-test []\n  (is (= 1 1)))\n\n(deftest new-test []\n  (is (= 1\n        (inc 0)))\n";
+  const file = path.join(tmp, "clean.clj");
+  writeFileSync(file, before, "utf8");
+  const id = nextID();
+  await handleBefore(beforeEvent("edit", { path: "clean.clj", oldString: "1", newString: "1" }, id), sessionDir);
+  writeFileSync(file, edited, "utf8");
+  mockFormat();
+
+  const event = afterEvent("edit", {}, { content: "Edited!" }, id);
+  await handleAfter(event, sessionDir);
+  assert.equal(
+    readFileSync(file, "utf8"),
+    "(deftest a-test []\n  (is (= 1 1)))\n\n(deftest new-test []\n  (is (= 1\n        (inc 0))))\n",
+  );
+  const message = resultText(event.result?.content);
+  assert.match(message, /Auto-repair note/);
+  // the repair stayed inside the region the edit changed, so nothing to flag
+  assert.doesNotMatch(message, /outside the lines your change made/);
+});
+
+test("edit: a repair that reaches outside the edited lines says so", async () => {
+  const before = "(defn f []\n  (let [x 1]\n    (inc x)))\n\n(def g 1)\n";
+  const edited = "(defn f []\n  (let [x 1\n    (inc x)))\n\n(def g 1)\n";
+  // a legal fix: the bracket returns on the error line, and one unrelated line
+  // is rewritten as well, within the guard window
+  const repaired = "(defn f []\n  (let [x 1]\n    (inc x)))\n\n(def g 1) ; touched\n";
+  const file = path.join(tmp, "wide.clj");
+  writeFileSync(file, before, "utf8");
+  const id = nextID();
+  await handleBefore(beforeEvent("edit", { path: "wide.clj", oldString: "[x 1]", newString: "[x 1" }, id), sessionDir);
+  writeFileSync(file, edited, "utf8");
+  mockRepair({ [edited]: { status: "repaired", text: repaired } });
+  mockFormat();
+
+  const event = afterEvent("edit", {}, { content: "Edited!" }, id);
+  await handleAfter(event, sessionDir);
+  assert.equal(readFileSync(file, "utf8"), repaired);
+  assert.match(resultText(event.result?.content), /outside the lines your change made/);
+  assert.match(resultText(event.result?.content), /line\(s\) 5/);
+});
+
 test("edit: failed call does not repair or restore", async () => {
   const file = path.join(tmp, "c.clj");
   writeFileSync(file, "(def c 1)\n", "utf8");
@@ -562,7 +826,7 @@ test("patch: balanced and repairable files all get updated", async () => {
   assert.match(text, /1: \(def b 1\)/);
 });
 
-test("patch: unfixable update restores from backup", async () => {
+test("patch: one unfixable file reverts the whole patch", async () => {
   const dir = path.join(tmp, "patch-update-fail");
   mkdirSync(dir);
   setupPatchDir(dir);
@@ -576,12 +840,15 @@ test("patch: unfixable update restores from backup", async () => {
   mockFormat();
   const event = afterEvent("patch", {}, { content: "Applied 4 operations." }, id);
   await handleAfter(event, async () => dir);
-  assert.equal(readFileSync(path.join(dir, "b.clj"), "utf8"), "(def b 1)\n");
-  const message = resultText(event.result?.content);
-  assert.match(message, /could not be auto-fixed in .+b\.clj/);
+  const message = resultText(event?.result?.content);
+  assert.match(message, /prevented this patch: .+b\.clj/);
+  assert.match(message, /The whole patch was reverted\./);
   assert.match(message, /Restored from backup: .+b\.clj/);
-  // the repaired add target is kept as fixed
-  assert.equal(readFileSync(path.join(dir, "c.clj"), "utf8"), "(def c 1)\n");
+  // the files that repaired cleanly are rolled back too
+  assert.equal(readFileSync(path.join(dir, "b.clj"), "utf8"), "(def b 1)\n");
+  assert.equal(existsSync(path.join(dir, "c.clj")), false, "the added file was removed");
+  assert.equal(readFileSync(path.join(dir, "d.clj"), "utf8"), "(def d 1)\n");
+  assert.equal(existsSync(path.join(dir, "e.clj")), false, "the move destination was removed");
 });
 
 test("patch: unfixable move restores source and removes destination", async () => {
@@ -602,7 +869,31 @@ test("patch: unfixable move restores source and removes destination", async () =
   await handleAfter(event, async () => dir);
   assert.equal(readFileSync(path.join(dir, "d.clj"), "utf8"), "(def d 1)\n");
   assert.equal(existsSync(path.join(dir, "e.clj")), false);
-  assert.match(resultText(event.result?.content), /Restored from backup: .+d\.clj/);
+  const message = resultText(event.result?.content);
+  assert.match(message, /Restored from backup: .+d\.clj/);
+  assert.match(message, /Removed move destinations: .+e\.clj/);
+});
+
+test("patch: a refused repair reverts the files that repaired fine", async () => {
+  const dir = path.join(tmp, "patch-declined");
+  mkdirSync(dir);
+  setupPatchDir(dir);
+  const id = nextID();
+  await handleBefore(beforeEvent("patch", { patchText: PATCH }, id), async () => dir);
+  applyPatch(dir);
+  // a balanced proposal for b.clj, but it rewrites four lines for a one-line
+  // form: the guard refuses it, and nothing in this patch may land
+  const WIDE = "(a 1)\n(b 2)\n(c 3)\n(d 4)\n";
+  mockRepair({
+    [BROKEN]: { status: "repaired", text: WIDE },
+    [BROKEN_C]: { status: "repaired", text: "(def c 1)\n" },
+  });
+  mockFormat();
+  const event = afterEvent("patch", {}, { content: "Applied 4 operations." }, id);
+  await handleAfter(event, async () => dir);
+  assert.equal(readFileSync(path.join(dir, "b.clj"), "utf8"), "(def b 1)\n");
+  assert.equal(existsSync(path.join(dir, "c.clj")), false, "the cleanly repaired new file never got written");
+  assert.match(resultText(event.result?.content), /would have moved delimiters outside what you wrote/);
 });
 
 test("patch: unfixable add removes the new file", async () => {
@@ -621,6 +912,25 @@ test("patch: unfixable add removes the new file", async () => {
   await handleAfter(event, async () => dir);
   assert.equal(existsSync(path.join(dir, "c.clj")), false);
   assert.match(resultText(event.result?.content), /Removed newly added files: .+c\.clj/);
+});
+
+test("patch: a deleted Clojure file comes back when the patch is reverted", async () => {
+  const dir = path.join(tmp, "patch-delete-restore");
+  mkdirSync(dir);
+  setupPatchDir(dir);
+  writeFileSync(path.join(dir, "g.clj"), "(def g 1)\n", "utf8");
+  const patch = ["*** Update File: b.clj", "*** Delete File: g.clj"].join("\n");
+  const id = nextID();
+  await handleBefore(beforeEvent("patch", { patchText: patch }, id), async () => dir);
+  // the patch lands: b.clj is left broken and g.clj is gone
+  writeFileSync(path.join(dir, "b.clj"), BROKEN, "utf8");
+  rmSync(path.join(dir, "g.clj"));
+  mockRepair({ [BROKEN]: { status: "unfixable", message: "unfixable" } });
+  mockFormat();
+  const event = afterEvent("patch", {}, { content: "Applied 2 operations." }, id);
+  await handleAfter(event, async () => dir);
+  assert.equal(readFileSync(path.join(dir, "g.clj"), "utf8"), "(def g 1)\n");
+  assert.match(resultText(event.result?.content), /Restored from backup: .+b\.clj, .+g\.clj/);
 });
 
 test("patch: failed call does not repair or revert", async () => {
@@ -689,11 +999,44 @@ test("formatWithCljfmt: invokes cljfmt fix - with stdin", async () => {
   });
 });
 
-test("formatWithCljfmt: cljfmt output replaces the content", async () => {
-  const fakeDir = mkdtempSync(path.join(tmpdir(), "cplr-fake-cljfmt-"));
+test("formatWithCljfmt: whitespace-only output is applied", async () => {
+  const fakeDir = mkdtempSync(path.join(tmpdir(), "cplr-fake-cljfmt-reindent-"));
+  writeFileSync(path.join(fakeDir, "cljfmt"), "#!/bin/sh\nprintf '(def x\\n  1)\\n'\n", { mode: 0o755 });
+  await withPath(fakeDir, async () => {
+    assert.equal(await formatWithCljfmt("(def x\n1)"), "(def x\n  1)\n");
+  });
+});
+
+test("formatWithCljfmt: output that changes code is discarded", async () => {
+  const fakeDir = mkdtempSync(path.join(tmpdir(), "cplr-fake-cljfmt-code-change-"));
   writeFileSync(path.join(fakeDir, "cljfmt"), "#!/bin/sh\nprintf '(def x 2)\\n'\n", { mode: 0o755 });
   await withPath(fakeDir, async () => {
-    assert.equal(await formatWithCljfmt("(def x 1)"), "(def x 2)\n");
+    // cljfmt moves whitespace; anything else is treated as a broken tool rather
+    // than written over the author's code
+    assert.equal(await formatWithCljfmt("(def x 1)"), "(def x 1)");
+  });
+});
+
+test("formatWithCljfmt: empty output cannot empty the file", async () => {
+  const fakeDir = mkdtempSync(path.join(tmpdir(), "cplr-fake-cljfmt-empty-"));
+  // reads stdin, exits 0, writes nothing: what cljfmt does when it chokes
+  writeFileSync(path.join(fakeDir, "cljfmt"), "#!/bin/sh\nwhile IFS= read -r line; do :; done\n", { mode: 0o755 });
+  await withPath(fakeDir, async () => {
+    assert.equal(await formatWithCljfmt("(def x 1)"), "(def x 1)");
+  });
+});
+
+test("formatWithCljfmt: unparseable input is reported, not written back", async () => {
+  const fakeDir = mkdtempSync(path.join(tmpdir(), "cplr-fake-cljfmt-unparseable-"));
+  // real cljfmt exits 0 with empty stdout and this on stderr when it cannot read
+  // the forms; writing that back would empty the file
+  writeFileSync(
+    path.join(fakeDir, "cljfmt"),
+    "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf 'Failed to format file: STDIN\\n' >&2\n",
+    { mode: 0o755 },
+  );
+  await withPath(fakeDir, async () => {
+    assert.equal(await formatWithCljfmt("(def x (1"), "(def x (1");
   });
 });
 

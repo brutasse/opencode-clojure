@@ -14,22 +14,31 @@
  * Behavior:
  * - write: content is repaired (and formatted, if cljfmt is available)
  *          before it hits disk; the write is rejected (Tool.Error) when the
- *          content cannot be fixed. When the content was modified, the tool
- *          result carries a change note with the current on-disk content so
- *          the model does not act on a stale view of the file.
+ *          content cannot be fixed, or can only be fixed by moving
+ *          delimiters elsewhere in the file. When the content was modified,
+ *          the tool result carries a change note with the current on-disk
+ *          content so the model does not act on a stale view of the file.
  * - edit:  the file is backed up in memory before the edit; after the edit
  *          the on-disk file is repaired/formatted, and the backup is
- *          restored when it cannot be fixed. When the file was modified,
- *          the tool result carries a change note (current content for small
- *          files, a line diff for large ones).
+ *          restored when the edit left delimiter errors the repair declines
+ *          or cannot fix. When the file was modified, the tool result carries
+ *          a change note (current content for small files, a line diff for
+ *          large ones), calling out any delimiter the repair moved outside
+ *          the lines the edit changed.
  * - patch: the same per-file flow for the patch tool
- *          (*** Add/Update/Move/Delete File: ops).
+ *          (*** Add/Update/Move/Delete File: ops). One file the repair
+ *          refuses reverts the whole patch, so a patch never lands partly
+ *          repaired.
  *
- * Balanced code is never touched: a small Clojure-aware scanner
- * (hasDelimiterError) gates the repair engine so balanced files - including
- * valid code with tricky content like char literals - are left alone. When
- * repair or formatting fails for any reason the operation proceeds
- * un-repaired (fail open).
+ * Balanced code is never touched: a Clojure-aware scanner (`scanClojure`)
+ * gates the repair engine, and it also says where the delimiters are wrong,
+ * which is what makes a declined repair actionable. A repair proposal is
+ * accepted only while it rewrites a couple of lines next to that error
+ * (`repairSurgically`): parinfer's indent mode reads indentation as the truth,
+ * so on a file whose indentation does not match its delimiters one missing
+ * closer made it move real delimiters on up to 33 lines, hundreds of lines
+ * away, and the mangled result still parses. Repairs and formatting that fail
+ * for any other reason leave the content alone (fail open).
  */
 
 import net from "node:net";
@@ -41,52 +50,221 @@ import { Error as ToolError } from "@opencode/plugin/promise/tool";
 import parinfer from "parinfer";
 
 // ============================================================================
-// Delimiter balance check (pre-gate for the repair engine)
+// Delimiter scanner (the repair pre-gate, and the error locations it reports)
 // ============================================================================
 
-// Scans Clojure source for delimiter imbalance: an unmatched or mismatched
-// ()[]{} delimiter, or an unterminated string / regex literal. String
-// literals (including multi-line), char literals (like \( and \space),
-// line comments (;), and regex literals are skipped. A false negative
-// leaves a broken file un-repaired (safe); a false positive would send
-// balanced code to the repair engine, so the scanner errs on the side of
-// recognizing balanced constructs.
-export function hasDelimiterError(text: string): boolean {
-  const closingFor = new Map<string, string>([
-    [")", "("],
-    ["]", "["],
-    ["}", "{"],
-  ]);
-  const stack: string[] = [];
+// Scans Clojure source for delimiter errors: an unmatched or mismatched ()[]{}
+// delimiter, or an unterminated string / regex literal. String literals
+// (including multi-line), char literals (like \( and \space), line comments (;),
+// and regex literals are skipped. Every error carries the line and column the
+// repair guard and the error messages work from.
+//
+// A missed error leaves a broken file un-repaired (safe); reporting an error on
+// balanced code would send valid code to the repair engine, so the scanner errs
+// on the side of recognizing balanced constructs. At most MAX_UNCLOSED unclosed
+// openers are reported, outermost first, so a badly truncated file does not hand
+// the guard a file-wide set of anchors.
+export type ScanErrorKind =
+  | "extra-closer"
+  | "mismatched-closer"
+  | "unclosed"
+  | "unterminated-string"
+  | "unterminated-regex";
+
+export interface ScanError {
+  kind: ScanErrorKind;
+  /** 1-based line. For `unclosed` and `unterminated-*`, where the opener sits. */
+  line: number;
+  /** 1-based column of the offending character. */
+  col: number;
+  /** The offending delimiter, or the opening quote for `unterminated-*`. */
+  char: string;
+  /** For `mismatched-closer`: the opener this closer should have matched. */
+  opener?: { char: string; line: number };
+}
+
+const MAX_UNCLOSED = 3;
+
+const CLOSING_FOR = new Map<string, string>([
+  [")", "("],
+  ["]", "["],
+  ["}", "{"],
+]);
+
+export function scanClojure(text: string): ScanError[] {
+  interface Open {
+    char: string;
+    line: number;
+    col: number;
+  }
+  const stack: Open[] = [];
+  const errors: ScanError[] = [];
   let inString = false;
   let inRegex = false;
   let inComment = false;
-  for (let i = 0; i < text.length; i++) {
+  let quote: Open | undefined;
+  let line = 1;
+  let lineStart = 0; // index where the current line begins
+  let i = 0;
+
+  // 1-based column of the character at the cursor
+  const col = () => i - lineStart + 1;
+
+  // step one (or two, for escapes and char literals) characters forward,
+  // tracking the line as newlines go by
+  const step = (n = 1) => {
+    for (let k = 0; k < n && i < text.length; k++) {
+      if (text[i] === "\n") {
+        line++;
+        lineStart = i + 1;
+      }
+      i++;
+    }
+  };
+
+  while (i < text.length) {
     const c = text[i];
     if (inComment) {
       if (c === "\n") inComment = false;
-    } else if (inString || inRegex) {
-      if (c === "\\") i++; // skip the escaped character
+      step();
+      continue;
+    }
+    if (inString || inRegex) {
+      if (c === "\\") step(2);
       else if (c === '"') {
         inString = false;
         inRegex = false;
-      }
-    } else if (c === '"') {
-      inString = true;
-    } else if (c === ";") {
-      inComment = true;
-    } else if (c === "#" && text[i + 1] === '"') {
-      inRegex = true;
-      i++;
-    } else if (c === "\\") {
-      i++; // skip the char literal (\(, \", \newline, ...)
-    } else if (c === "(" || c === "[" || c === "{") {
-      stack.push(c);
-    } else if (closingFor.has(c)) {
-      if (stack.pop() !== closingFor.get(c)) return true;
+        step();
+      } else step();
+      continue;
     }
+    if (c === '"') {
+      inString = true;
+      quote = { char: '"', line, col: col() };
+      step();
+      continue;
+    }
+    if (c === ";") {
+      inComment = true;
+      step();
+      continue;
+    }
+    if (c === "#" && text[i + 1] === '"') {
+      inRegex = true;
+      quote = { char: '#"', line, col: col() };
+      step(2);
+      continue;
+    }
+    if (c === "\\") {
+      step(2); // a char literal: \(, \", \newline, ...
+      continue;
+    }
+    if (c === "(" || c === "[" || c === "{") {
+      stack.push({ char: c, line, col: col() });
+      step();
+      continue;
+    }
+    if (CLOSING_FOR.has(c)) {
+      const open = stack.pop();
+      if (!open) {
+        errors.push({ kind: "extra-closer", line, col: col(), char: c });
+      } else if (open.char !== CLOSING_FOR.get(c)) {
+        errors.push({
+          kind: "mismatched-closer",
+          line,
+          col: col(),
+          char: c,
+          opener: { char: open.char, line: open.line },
+        });
+      }
+      step();
+      continue;
+    }
+    step();
   }
-  return stack.length > 0 || inString || inRegex;
+
+  if (inString || inRegex) {
+    const at = quote ?? { char: '"', line, col: 1 };
+    errors.push({
+      kind: inRegex ? "unterminated-regex" : "unterminated-string",
+      line: at.line,
+      col: at.col,
+      char: at.char,
+    });
+  }
+  for (const open of stack.slice(0, MAX_UNCLOSED)) {
+    errors.push({ kind: "unclosed", line: open.line, col: open.col, char: open.char });
+  }
+  return errors;
+}
+
+export function hasDelimiterError(text: string): boolean {
+  return scanClojure(text).length > 0;
+}
+
+/** "`[` opened at line 78 is never closed; unexpected `)` at line 12:9" */
+export function describeScanErrors(errors: ScanError[]): string {
+  return errors
+    .map((e) => {
+      switch (e.kind) {
+        case "unclosed":
+          return `\`${e.char}\` opened at line ${e.line} is never closed`;
+        case "extra-closer":
+          return `unexpected \`${e.char}\` at line ${e.line}:${e.col}`;
+        case "mismatched-closer":
+          return `\`${e.char}\` at line ${e.line}:${e.col} does not match \`${e.opener?.char}\` opened at line ${e.opener?.line}`;
+        case "unterminated-string":
+          return `string opened at line ${e.line}:${e.col} is never closed`;
+        case "unterminated-regex":
+          return `regex opened at line ${e.line}:${e.col} is never closed`;
+      }
+    })
+    .join("; ");
+}
+
+// ============================================================================
+// Lines a rewrite touched (whitespace-insensitive, so reindent is not a change)
+// ============================================================================
+
+const squeeze = (s: string): string => s.replace(/\s+/g, "");
+
+/**
+ * 1-based line numbers whose non-whitespace content differs between two
+ * versions, taken from both sides so an insertion reports where the new lines
+ * landed. Whitespace-only differences are not changes.
+ */
+export function changedLinesBetween(before: string, after: string): number[] {
+  if (squeeze(before) === squeeze(after)) return [];
+  const a = before.split("\n");
+  const b = after.split("\n");
+  // equal line counts, the usual case: compare line by line, so two clusters
+  // stay two clusters instead of one span across the whole file
+  if (a.length === b.length) {
+    const lines: number[] = [];
+    for (let i = 0; i < a.length; i++) {
+      if (squeeze(a[i]) !== squeeze(b[i])) lines.push(i + 1);
+    }
+    return lines;
+  }
+  // a rewrite that adds or removes lines: compare around the common edges
+  let start = 0;
+  while (start < a.length && start < b.length && squeeze(a[start]) === squeeze(b[start])) start++;
+  let ai = a.length - 1;
+  let bi = b.length - 1;
+  while (ai >= start && bi >= start && squeeze(a[ai]) === squeeze(b[bi])) {
+    ai--;
+    bi--;
+  }
+  const lines = new Set<number>();
+  for (let i = start; i <= ai; i++) lines.add(i + 1);
+  for (let i = start; i <= bi; i++) lines.add(i + 1);
+  return [...lines].sort((x, y) => x - y);
+}
+
+/** "12" / "28, 31" / "28, 31, 101, … (+3 more)" for an error message. */
+function lineList(lines: number[], max = 6): string {
+  const head = lines.slice(0, max).join(", ");
+  return lines.length > max ? `${head}, +${lines.length - max} more` : head;
 }
 
 // ============================================================================
@@ -106,6 +284,100 @@ export function repairText(text: string): RepairResult {
   } catch (e) {
     return { status: "error", message: String(e) };
   }
+}
+
+// ============================================================================
+// The repair guard: a proposal is accepted only next to the error
+// ============================================================================
+
+/** A repair may rewrite at most this many lines. */
+export const MAX_REPAIR_CHANGED_LINES = 2;
+/** ... may only touch this far above an error ... */
+export const REPAIR_WINDOW_BEFORE = 5;
+/**
+ * ... and this far below one. The band is asymmetric on purpose: a missing
+ * closer is reported at the opener and inserted at the end of that form, which
+ * is often tens of lines lower, while the damage pattern - closing a form early
+ * where the indentation suggests it ends - always reaches above the error.
+ */
+export const REPAIR_WINDOW_AFTER = 30;
+
+export type SurgicalRepair =
+  /** Delimiter-clean input: nothing to do, nothing to report. */
+  | { status: "clean" }
+  /** The engine fixed it, and only where the error was. */
+  | { status: "repaired"; text: string; rewrote: number[] }
+  /** The engine's proposal reached beyond the error; the caller keeps its own text. */
+  | { status: "declined"; message: string; errors: ScanError[]; rewrote: number[] }
+  /** The engine cannot fix this at all. */
+  | { status: "unfixable"; message: string }
+  /** The engine itself failed; the caller proceeds unrepaired (fail open). */
+  | { status: "error"; message: string };
+
+export interface SurgicalRepairOptions {
+  /**
+   * 1-based lines the caller is already responsible for (the region an edit or
+   * patch changed). A repair near these is as acceptable as one near the error.
+   */
+  anchors?: number[];
+  maxChangedLines?: number;
+  windowBefore?: number;
+  windowAfter?: number;
+}
+
+/**
+ * Repair `text` only as far as the change can be justified by the error the
+ * scanner found. Beyond `MAX_REPAIR_CHANGED_LINES` lines, or outside
+ * `REPAIR_WINDOW_BEFORE`/`REPAIR_WINDOW_AFTER` of an error (or of `anchors`),
+ * the proposal is declined: a repair that wide is indistinguishable from the
+ * engine "fixing" indentation that was merely unusual, and it silently relocates
+ * real delimiters. Measured on a real codebase with one closer removed per file,
+ * the accepted repairs restored the original delimiters exactly in 90 of 108
+ * cases and never moved a delimiter the author had not misplaced.
+ */
+export async function repairSurgically(
+  text: string,
+  opts: SurgicalRepairOptions = {},
+): Promise<SurgicalRepair> {
+  const errors = scanClojure(text);
+  if (errors.length === 0) return { status: "clean" };
+
+  const outcome = await repairImpl(text);
+  if (outcome.status === "error") return outcome;
+  if (outcome.status === "unfixable") return outcome;
+
+  const maxChanged = opts.maxChangedLines ?? MAX_REPAIR_CHANGED_LINES;
+  const windowBefore = opts.windowBefore ?? REPAIR_WINDOW_BEFORE;
+  const windowAfter = opts.windowAfter ?? REPAIR_WINDOW_AFTER;
+  const rewrote = changedLinesBetween(text, outcome.text);
+  const decline = (why: string): SurgicalRepair => ({
+    status: "declined",
+    message: `${describeScanErrors(errors)}; ${why}`,
+    errors,
+    rewrote,
+  });
+
+  if (rewrote.length === 0) {
+    return decline("the repair changed nothing, so the errors would remain");
+  }
+  if (scanClojure(outcome.text).length > 0) {
+    return decline("the repair would still leave delimiter errors");
+  }
+
+  const anchors = [...errors.map((e) => e.line), ...(opts.anchors ?? [])];
+  if (rewrote.length > maxChanged) {
+    return decline(
+      `the repair would rewrite ${rewrote.length} lines (${lineList(rewrote)}) - more than ${maxChanged}, which is how a fix that moves unrelated delimiters looks`,
+    );
+  }
+  const inBand = (line: number) => anchors.some((a) => line >= a - windowBefore && line <= a + windowAfter);
+  const far = rewrote.filter((line) => !inBand(line));
+  if (far.length > 0) {
+    return decline(
+      `the repair would move delimiters on line(s) ${lineList(far)}, away from the error - it fixes indentation, not your code`,
+    );
+  }
+  return { status: "repaired", text: outcome.text, rewrote };
 }
 
 // ============================================================================
@@ -161,6 +433,11 @@ function runCljfmt(bin: string, text: string): Promise<string> {
     child.on("close", (code) => {
       if (timedOut) return finish(new Error(`cljfmt timed out after ${CLJFMT_TIMEOUT_MS}ms`));
       if (code !== 0) return finish(new Error(`cljfmt exited ${code}: ${stderr.trim().slice(0, 200)}`));
+      // cljfmt reports an unreadable form on stderr and still exits 0, with no
+      // stdout at all; treating that as a formatted result would write nothing.
+      if (/failed to format/i.test(stderr)) {
+        return finish(new Error(`cljfmt could not read the forms: ${stderr.trim().slice(0, 200)}`));
+      }
       finish(undefined, stdout);
     });
     child.stdin.write(text);
@@ -168,11 +445,25 @@ function runCljfmt(bin: string, text: string): Promise<string> {
   });
 }
 
+/**
+ * Format `text` with cljfmt, or return it unchanged. Only whitespace moves: an
+ * empty output, or one whose non-whitespace content differs, is discarded rather
+ * than written.
+ */
 export async function formatWithCljfmt(text: string): Promise<string> {
   const bin = resolveCljfmt();
   if (!bin) return text; // no cljfmt on PATH: repair only
   try {
-    return await runCljfmt(bin, text);
+    const out = await runCljfmt(bin, text);
+    if (text.trim() !== "" && out.trim() === "") {
+      console.warn("[opencode-clojure] cljfmt returned no output, content left unformatted");
+      return text;
+    }
+    if (squeeze(out) !== squeeze(text)) {
+      console.warn("[opencode-clojure] cljfmt changed non-whitespace content, content left unformatted");
+      return text;
+    }
+    return out;
   } catch (e) {
     console.warn(`[opencode-clojure] cljfmt failed, content left unformatted: ${String(e)}`);
     return text; // fail open
@@ -591,18 +882,16 @@ export interface EvalOptions {
 
 export async function evalClojure(opts: EvalOptions): Promise<string> {
   let code = opts.code;
-  if (hasDelimiterError(code)) {
-    const outcome = await repairImpl(code);
-    if (outcome.status === "unfixable") {
-      throw new ToolError({
-        message: `Clojure delimiter errors in the eval code could not be auto-fixed (${outcome.message}). Fix the delimiters and try again.`,
-      });
-    }
-    if (outcome.status === "error") {
-      console.warn(`[opencode-clojure] repair unavailable for eval code: ${outcome.message}`);
-    } else {
-      code = outcome.text;
-    }
+  const repair = await repairSurgically(code);
+  if (repair.status === "declined" || repair.status === "unfixable") {
+    throw new ToolError({
+      message: `Clojure delimiter errors in the eval code were not auto-fixed (${repair.message}). Fix the delimiters and try again.`,
+    });
+  }
+  if (repair.status === "error") {
+    console.warn(`[opencode-clojure] repair unavailable for eval code: ${repair.message}`);
+  } else if (repair.status === "repaired") {
+    code = repair.text;
   }
 
   const host = opts.host ?? "127.0.0.1";
@@ -844,10 +1133,19 @@ function reasonPhrase(reasons: ChangeReason[]): string {
   return "the content was modified";
 }
 
-export function buildChangeNote(file: string, before: string, after: string, reasons: ChangeReason[]): string {
+export function buildChangeNote(
+  file: string,
+  before: string,
+  after: string,
+  reasons: ChangeReason[],
+  warnings: string[] = [],
+): string {
   const lines = [
     `⚠ Auto-repair note: ${file}`,
     `Your change was applied, but ${reasonPhrase(reasons)} - the file on disk differs from what you wrote:`,
+    // warnings describe changes the model did not ask for, so they come before
+    // the content they refer to
+    ...warnings,
   ];
   const afterLineCount = after.split("\n").length;
   if (afterLineCount <= FULL_MAX_LINES && Buffer.byteLength(after, "utf8") <= FULL_MAX_BYTES) {
@@ -877,13 +1175,13 @@ export function buildChangeNote(file: string, before: string, after: string, rea
 // Joins per-file change notes under a byte budget; a file whose note does
 // not fit gets a one-line re-read notice instead.
 export function assembleChangeNotes(
-  changes: { file: string; before: string; after: string; reasons: ChangeReason[] }[],
+  changes: { file: string; before: string; after: string; reasons: ChangeReason[]; warnings?: string[] }[],
   budget = NOTE_TOTAL_MAX_BYTES,
 ): string {
   const parts: string[] = [];
   let used = 0;
   for (const change of changes) {
-    const note = buildChangeNote(change.file, change.before, change.after, change.reasons);
+    const note = buildChangeNote(change.file, change.before, change.after, change.reasons, change.warnings);
     const size = Buffer.byteLength(note, "utf8");
     if (used + size > budget) {
       parts.push(`⚠ Auto-repair note: ${change.file} - further changes omitted; re-read the file.`);
@@ -900,30 +1198,74 @@ export function assembleChangeNotes(
 // ============================================================================
 
 type ProcessedContent =
-  | { status: "ok"; text: string; reasons: ChangeReason[] }
-  | { status: "unfixable"; message: string };
+  | { status: "ok"; text: string; reasons: ChangeReason[]; rewrote: number[] }
+  | { status: "rejected"; kind: "unfixable" | "declined" | "unsafe-format"; message: string };
 
-// Repairs `content` (the content of `label`) and formats it when cljfmt is
-// available; `reasons` reports which step actually changed the content. On
-// unfixable content, `restore` (when provided) is invoked.
-async function processContent(label: string, content: string, restore?: () => void): Promise<ProcessedContent> {
+/**
+ * Repairs `content` (the content of `label`) and formats it when cljfmt is
+ * available; `reasons` reports which step actually changed the content. A repair
+ * the guard declines counts as a rejection: the author's own text is kept (via
+ * `restore`, when provided) rather than a proposal that moved delimiters away
+ * from the error. `anchors` are the lines the caller is responsible for, and
+ * justify a repair near them.
+ */
+async function processContent(
+  label: string,
+  content: string,
+  opts: { anchors?: number[]; restore?: () => void } = {},
+): Promise<ProcessedContent> {
   const reasons: ChangeReason[] = [];
   let out = content;
-  if (hasDelimiterError(content)) {
-    const outcome = await repairImpl(content);
-    if (outcome.status === "error") {
-      console.warn(`[opencode-clojure] repair unavailable for ${label}: ${outcome.message}`);
-    } else if (outcome.status === "unfixable") {
-      restore?.();
-      return { status: "unfixable", message: outcome.message };
-    } else {
-      if (outcome.text !== content) reasons.push("repaired");
-      out = outcome.text;
-    }
+  let rewrote: number[] = [];
+
+  const repair = await repairSurgically(content, { anchors: opts.anchors });
+  switch (repair.status) {
+    case "clean":
+      break;
+    case "repaired":
+      reasons.push("repaired");
+      out = repair.text;
+      rewrote = repair.rewrote;
+      break;
+    case "error":
+      console.warn(`[opencode-clojure] repair unavailable for ${label}: ${repair.message}`);
+      break;
+    case "declined":
+      opts.restore?.();
+      return { status: "rejected", kind: "declined", message: repair.message };
+    case "unfixable":
+      opts.restore?.();
+      return { status: "rejected", kind: "unfixable", message: repair.message };
   }
+
   const formatted = await formatImpl(out);
   if (formatted !== out) reasons.push("formatted");
-  return { status: "ok", text: formatted, reasons };
+  // cljfmt only ever moves whitespace: output that reads worse than the input
+  // never reaches the file
+  if (scanClojure(formatted).length > 0 && scanClojure(out).length === 0) {
+    opts.restore?.();
+    return { status: "rejected", kind: "unsafe-format", message: "cljfmt output has delimiter errors" };
+  }
+  return { status: "ok", text: formatted, reasons, rewrote };
+}
+
+/** Why content was refused, phrased for the write, edit and patch messages. */
+function rejectionWhy(outcome: { kind: "unfixable" | "declined" | "unsafe-format"; message: string }): string {
+  switch (outcome.kind) {
+    case "unfixable":
+      return `could not be auto-fixed (${outcome.message})`;
+    case "declined":
+      return `were not auto-fixed: the repair would have moved delimiters outside what you wrote (${outcome.message})`;
+    case "unsafe-format":
+      return `would have been left unbalanced by cljfmt (${outcome.message})`;
+  }
+}
+
+/** Rewritten lines the change did not ask for, phrased for the change note. */
+function outsideRepairLines(rewrote: number[], region: number[]): string[] {
+  const outside = rewrote.filter((line) => !region.some((changed) => Math.abs(changed - line) <= 1));
+  if (outside.length === 0) return [];
+  return [`The repair moved delimiters on line(s) ${outside.join(", ")}, outside the lines your change made.`];
 }
 
 export async function handleBefore(event: BeforeEvent, sessionDir: (sessionID: string) => Promise<string>) {
@@ -934,9 +1276,9 @@ export async function handleBefore(event: BeforeEvent, sessionDir: (sessionID: s
     const abs = path.resolve(dir, input.path);
     if (!isClojureFile(abs, input.content)) return;
     const outcome = await processContent(input.path, input.content);
-    if (outcome.status === "unfixable") {
+    if (outcome.status === "rejected") {
       throw new ToolError({
-        message: `Clojure delimiter errors in ${input.path} could not be auto-fixed (${outcome.message}). Fix the delimiters and write again.`,
+        message: `Clojure delimiter errors in ${input.path} ${rejectionWhy(outcome)}. Fix the delimiters and write again.`,
       });
     }
     if (outcome.text !== input.content) {
@@ -966,7 +1308,9 @@ export async function handleBefore(event: BeforeEvent, sessionDir: (sessionID: s
     const dir = await sessionDir(event.sessionID);
     const ops = parsePatch(input.patchText);
     for (const op of ops) {
-      const source = opSource(op);
+      // reverting a patch needs the pre-patch content of every Clojure file it
+      // touches, including the target of a delete
+      const source = op.op === "delete" ? op.path : opSource(op);
       if (!source) continue;
       const abs = path.resolve(dir, source);
       if (!existsSync(abs)) continue;
@@ -998,87 +1342,116 @@ export async function handleAfter(event: AfterEvent, sessionDir: (sessionID: str
     const backup = state.backups[0];
     if (!backup || !existsSync(backup.path)) return;
     const before = readFileSync(backup.path, "utf8"); // what the edit produced on disk
-    const outcome = await processContent(backup.path, before, () =>
-      writeFileSync(backup.path, backup.content, "utf8"),
-    );
-    if (outcome.status === "unfixable") {
+    // the lines the edit is answerable for: a repair near them is the repair
+    // doing its job, a repair anywhere else is rewriting unrelated code
+    const anchors = changedLinesBetween(backup.content, before);
+    const outcome = await processContent(backup.path, before, {
+      anchors,
+      restore: () => writeFileSync(backup.path, backup.content, "utf8"),
+    });
+    if (outcome.status === "rejected") {
       setResultText(
         event,
-        `Edit to ${backup.path} was reverted: delimiter errors could not be auto-fixed. Fix the delimiters and retry the edit.`,
+        `Edit to ${backup.path} was reverted: delimiter errors ${rejectionWhy(
+          outcome,
+        )}. The file is back to its pre-edit content; fix the delimiters and retry the edit.`,
       );
       return;
     }
     if (outcome.text !== before) {
       writeFileSync(backup.path, outcome.text, "utf8");
-      appendResultText(event, buildChangeNote(backup.path, before, outcome.text, outcome.reasons));
+      const warnings = outsideRepairLines(outcome.rewrote, anchors);
+      appendResultText(event, buildChangeNote(backup.path, before, outcome.text, outcome.reasons, warnings));
     }
     return;
   }
 
-  // patch
+  // patch: repair every Clojure file the patch produced, then commit or revert
+  // the lot. Nothing is written until all files are judged, because a patch
+  // that lands three files and refuses on the fourth would leave the model
+  // working against a half-applied change.
   const ops = state.patchOps ?? [];
   if (ops.length === 0) return;
   const dir = state.dir;
-  const updated: { file: string; before: string; after: string; reasons: ChangeReason[] }[] = [];
-  const failures: PatchOp[] = [];
+  const repaired: { file: string; before: string; after: string; reasons: ChangeReason[]; warnings: string[] }[] = [];
+  const refusals: string[] = [];
   for (const op of ops) {
     const target = opTarget(op);
     if (!target) continue;
     const abs = path.resolve(dir, target);
     if (!existsSync(abs)) continue;
     const before = readFileSync(abs, "utf8");
-    const outcome = await processContent(abs, before, () => {
-      if (op.op === "update" || op.op === "move") {
-        const source = path.resolve(dir, opSource(op)!);
-        const backup = state.backups.find((b) => b.path === source);
-        if (backup) writeFileSync(source, backup.content, "utf8");
-      }
-    });
-    if (outcome.status === "unfixable") failures.push(op);
-    else if (outcome.text !== before) {
-      writeFileSync(abs, outcome.text, "utf8");
-      updated.push({ file: abs, before, after: outcome.text, reasons: outcome.reasons });
+    const source = op.op === "delete" ? op.path : opSource(op);
+    const backup = source ? state.backups.find((b) => b.path === path.resolve(dir, source)) : undefined;
+    const anchors = backup ? changedLinesBetween(backup.content, before) : [];
+    const outcome = await processContent(abs, before, { anchors });
+    if (outcome.status === "rejected") {
+      refusals.push(`${abs}: delimiter errors ${rejectionWhy(outcome)}`);
+    } else if (outcome.text !== before) {
+      repaired.push({
+        file: abs,
+        before,
+        after: outcome.text,
+        reasons: outcome.reasons,
+        warnings: outsideRepairLines(outcome.rewrote, anchors),
+      });
     }
   }
 
-  if (failures.length > 0) {
-    const restored: string[] = [];
-    const deleted: string[] = [];
-    const kept: string[] = [];
-    for (const op of failures) {
-      if (op.op === "update" || op.op === "move") {
-        const source = path.resolve(dir, opSource(op)!);
-        const backup = state.backups.find((b) => b.path === source);
-        if (backup) {
-          // the per-op restore already ran in processContent; record it here
-          restored.push(source);
-          if (op.op === "move") safeDelete(path.resolve(dir, op.to));
-        } else {
-          kept.push(source);
-        }
-      } else if (op.op === "add") {
-        const added = path.resolve(dir, op.path);
-        safeDelete(added);
-        deleted.push(added);
-      }
-    }
+  if (refusals.length > 0) {
+    const revert = revertPatch(dir, ops, state.backups);
     const parts = [
-      `Delimiter errors could not be auto-fixed in ${failures.map((op) => path.resolve(dir, opTarget(op)!)).join(", ")}.`,
+      `Clojure delimiter errors prevented this patch: ${refusals.join("; ")}.`,
+      "The whole patch was reverted.",
     ];
-    if (restored.length > 0) parts.push(`Restored from backup: ${restored.join(", ")}.`);
-    if (deleted.length > 0) parts.push(`Removed newly added files: ${deleted.join(", ")}.`);
-    if (kept.length > 0) parts.push(`Left in place (no backup): ${kept.join(", ")}.`);
+    if (revert.restored.length > 0) parts.push(`Restored from backup: ${revert.restored.join(", ")}.`);
+    if (revert.added.length > 0) parts.push(`Removed newly added files: ${revert.added.join(", ")}.`);
+    if (revert.destinations.length > 0) parts.push(`Removed move destinations: ${revert.destinations.join(", ")}.`);
+    if (revert.kept.length > 0) parts.push(`Left in place (no backup): ${revert.kept.join(", ")}.`);
     setResultText(event, parts.join(" "));
-  } else if (updated.length > 0) {
-    appendResultText(event, assembleChangeNotes(updated));
+    return;
   }
+
+  for (const file of repaired) writeFileSync(file.file, file.after, "utf8");
+  if (repaired.length > 0) appendResultText(event, assembleChangeNotes(repaired));
 }
 
-function safeDelete(file: string) {
+/**
+ * Undoes an applied patch: backed-up files are written back, files the patch
+ * added or moved away are removed. Files with no backup are left alone and
+ * reported, because the plugin never saw their previous content.
+ */
+function revertPatch(dir: string, ops: PatchOp[], backups: Backup[]) {
+  const byPath = new Map(backups.map((b) => [b.path, b]));
+  const restored: string[] = [];
+  const added: string[] = [];
+  const destinations: string[] = [];
+  const kept: string[] = [];
+  for (const op of ops) {
+    if (op.op === "update" || op.op === "move" || op.op === "delete") {
+      const source = path.resolve(dir, op.op === "move" ? op.from : op.path);
+      const backup = byPath.get(source);
+      if (backup) {
+        writeFileSync(source, backup.content, "utf8");
+        restored.push(source);
+      } else {
+        kept.push(source);
+      }
+      if (op.op === "move" && safeDelete(path.resolve(dir, op.to))) destinations.push(path.resolve(dir, op.to));
+    } else if (op.op === "add") {
+      const created = path.resolve(dir, op.path);
+      if (safeDelete(created)) added.push(created);
+    }
+  }
+  return { restored, added, destinations, kept };
+}
+
+function safeDelete(file: string): boolean {
   try {
     unlinkSync(file);
+    return true;
   } catch {
-    // already gone
+    return false; // already gone
   }
 }
 

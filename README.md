@@ -15,26 +15,42 @@ protocol) is implemented in-process, and formatting runs
 
 | Tool | Before the call | After the call |
 |------|-----------------|----------------|
-| `write` | Content is repaired in-process (and formatted, if cljfmt is available) and replaced in the tool input. Unfixable content **rejects the write** (`Tool.Error`) before anything hits disk. | When the content was modified, the result carries a change note (current on-disk content, or a diff for large files) so the model does not act on a stale view. |
-| `edit` | The file is backed up in memory (keyed by the tool call ID). | The on-disk file is repaired and formatted. Unfixable → the backup is restored and the result tells the model to fix the delimiters and retry. Changed → the result carries a change note with the current on-disk content (small files) or a diff of the changed lines (large files). |
-| `patch` | Every existing Clojure file the patch will update or move-from is backed up. | Each resulting Clojure file is repaired and formatted. Unfixable → per-op revert (update/move: restore the backup, move also removes the destination; add: delete the new file) and the result lists what was restored, removed, and left in place. Changed → per-file change notes under a size budget (a file whose note does not fit gets a re-read notice instead). |
+| `write` | Content is repaired in-process (and formatted, if cljfmt is available) and replaced in the tool input. Content the repair cannot fix, or can only fix by moving unrelated delimiters, **rejects the write** (`Tool.Error`) before anything hits disk. | When the content was modified, the result carries a change note (current on-disk content, or a diff for large files) so the model does not act on a stale view. |
+| `edit` | The file is backed up in memory (keyed by the tool call ID). | The on-disk file is repaired and formatted. Rejected → the backup is restored and the result names the delimiter, its line, and what a repair would have moved, so the model can fix it and retry. Changed → the result carries a change note with the current on-disk content (small files) or a diff of the changed lines (large files), and says so if the repair touched lines the edit did not. |
+| `patch` | Every existing Clojure file the patch will update, move-from, or delete is backed up. | Every resulting Clojure file is judged before anything is written. Any refusal reverts the whole patch, so a patch never lands partly repaired: backups are written back, added files and move destinations are removed, deleted files come back, and the result lists each of those. Otherwise per-file change notes go under a size budget (a file whose note does not fit gets a re-read notice instead). |
 
 Details:
 
-- **Balanced code is never touched.** A small Clojure-aware scanner
-  (strings, char literals, line comments, regex literals, delimiter stack)
-  only runs the repair engine when delimiters are actually unbalanced, so
-  valid files are never rewritten.
+- **Balanced code is never touched.** A Clojure-aware scanner (strings, char
+  literals, line comments, regex literals, delimiter stack) reports where the
+  delimiters go wrong, and the repair engine only runs when they actually are
+  unbalanced.
+- **Repairs stay next to the error.** A repair proposal is accepted only when it
+  rewrites at most two lines, each within five lines above or thirty below a
+  reported error or the lines your change made. Anything wider is refused and
+  your text is kept, with the error's line in the message. Parinfer's indent mode
+  reads indentation as the truth, so in a file whose indentation does not match
+  its delimiters one missing closer made it move delimiters on up to 58 lines,
+  and the mangled file still parsed. The band is asymmetric because a missing
+  closer is reported at its opener and inserted at the end of that form, often
+  tens of lines lower, while closing a form early always reaches above the error.
+  Measured on a Clojure codebase with one closer removed per file: 90 of 108
+  damaged files were repaired, each one restoring exactly the delimiters the
+  author wrote, and none moved a delimiter the author had not misplaced.
 - **Non-Clojure files are ignored.** A file counts as Clojure when its name
   ends in `.clj`, `.cljs`, `.cljc`, `.cljd`, `.bb`, `.lpy`, or `.edn`
   (case-insensitive), or its first line is a `#!/.../bb` or `#!/.../env bb`
   shebang.
-- **cljfmt is optional.** When a `cljfmt` executable is found on `PATH`,
-  every repaired (or clean) Clojure result is formatted with `cljfmt fix -`
-  (stdin to stdout, 30s timeout). Otherwise formatting is skipped and only
-  delimiter repair happens.
-- **Fail open.** If repair or formatting fails for any reason, the operation
-  proceeds with the un-repaired content and a warning is logged.
+- **cljfmt is optional, and only moves whitespace.** When a `cljfmt` executable
+  is found on `PATH`, every repaired (or clean) Clojure result is formatted with
+  `cljfmt fix -` (stdin to stdout, 30s timeout). Output that is empty, or that
+  differs in any non-whitespace character, is discarded — cljfmt exits `0` with
+  no output at all when it cannot read the forms, and writing that back would
+  empty the file. Otherwise formatting is skipped and only delimiter repair
+  happens.
+- **Fail open, except for repairs that would reach too far.** If repair or
+  formatting fails for any other reason, the operation proceeds with the
+  un-repaired content and a warning is logged.
 - **Relative paths** (e.g. `foo.clj`) are resolved against the session's
   working directory.
 
@@ -49,8 +65,8 @@ custom-instructions teaching:
   reconnect), so a namespace required in one call is available in the next —
   the same statefulness `clj-nrepl-eval` gives from the command line.
 - **Repair first.** The same delimiter repair runs on the code before
-  evaluation; unfixable code is rejected with an error instead of being
-  evaluated.
+  evaluation; code the repair cannot fix locally is rejected with an error
+  naming the delimiter and its line, instead of being evaluated.
 - **Port discovery.** An explicit `port` input, otherwise `.nrepl-port` (or
   `.shadow-cljs/.nrepl-port`) in the session's working directory.
 - **Timeouts.** 120s by default, per-call `timeoutMs`; on timeout the running
@@ -60,8 +76,8 @@ Input: `{ code, port?, host? (default 127.0.0.1), timeoutMs? }`. Results
 carry the evaluated values (`=>`), stdout/stderr, the active namespace, and
 any exception with a truncated trace. Evaluation errors (an exception thrown
 by the code) are returned as normal results so the model can read them;
-operational failures (no port, connection refused, timeout, unfixable
-code) fail the tool call with a `Tool.Error`.
+operational failures (no port, connection refused, timeout, delimiter errors
+the repair will not touch) fail the tool call with a `Tool.Error`.
 
 ## Requirements
 
