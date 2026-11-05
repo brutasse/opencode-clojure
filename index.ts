@@ -1,6 +1,6 @@
 /**
- * OpenCode plugin: automatic Clojure delimiter repair + nREPL evaluation
- * (self-contained).
+ * OpenCode plugin: automatic Clojure delimiter repair, a delimiter-scan
+ * tool, and nREPL evaluation (self-contained).
  *
  * Delimiter repair runs in-process through the `parinfer` npm package
  * (`indentMode`, Parinfer's indent mode). Formatting runs `cljfmt`
@@ -29,6 +29,10 @@
  *          (*** Add/Update/Move/Delete File: ops). One file the repair
  *          refuses reverts the whole patch, so a patch never lands partly
  *          repaired.
+ * - scan:  the `clojure-scan` tool reports the delimiter errors of a file
+ *          the hooks did not see (typically one a shell command changed).
+ *          Read-only: it names the errors and shows the offending lines,
+ *          and never repairs.
  *
  * Balanced code is never touched: a Clojure-aware scanner (`scanClojure`)
  * gates the repair engine, and it also says where the delimiters are wrong,
@@ -954,6 +958,75 @@ export function isClojureFile(filePath: string, content?: string): boolean {
 }
 
 // ============================================================================
+// File scanning (the clojure-scan tool backend)
+// ============================================================================
+
+/** At most this many error phrases per report. */
+export const MAX_SCAN_REPORT_ERRORS = 6;
+/** ... and this many offending lines. */
+export const MAX_SCAN_REPORT_LINES = 6;
+/** Offending lines are shown at most this wide, before a truncation mark. */
+const SCAN_REPORT_LINE_WIDTH = 120;
+
+/**
+ * The report the `clojure-scan` tool returns for `abs` holding `content`: a
+ * one-line verdict when the delimiters balance, otherwise one phrase per
+ * error (capped) plus the offending lines, numbered, so the caller can fix
+ * the file without re-reading it.
+ */
+export function scanReport(abs: string, content: string): string {
+  const errors = scanClojure(content);
+  if (errors.length === 0) return `${abs}: delimiters balanced`;
+  const lines = content.split("\n");
+  const out = [`${abs}: ${errors.length} delimiter ${errors.length === 1 ? "error" : "errors"}:`];
+  const phrases = errors.map((e) => describeScanErrors([e]));
+  for (const phrase of phrases.slice(0, MAX_SCAN_REPORT_ERRORS)) out.push(`  ${phrase}`);
+  if (phrases.length > MAX_SCAN_REPORT_ERRORS) out.push(`  +${phrases.length - MAX_SCAN_REPORT_ERRORS} more`);
+  const errorLines = [...new Set(errors.map((e) => e.line))].sort((a, b) => a - b);
+  for (const n of errorLines.slice(0, MAX_SCAN_REPORT_LINES)) {
+    const text = lines[n - 1] ?? "";
+    out.push(`  L${n}: ${text.length > SCAN_REPORT_LINE_WIDTH ? text.slice(0, SCAN_REPORT_LINE_WIDTH) + "…" : text}`);
+  }
+  if (errorLines.length > MAX_SCAN_REPORT_LINES) out.push(`  +${errorLines.length - MAX_SCAN_REPORT_LINES} more lines`);
+  return out.join("\n");
+}
+
+export interface ScanOptions {
+  /** The file to check, as given (absolute, or relative to `dir`). */
+  path: string;
+  /** The session's working directory relative paths resolve against. */
+  dir: string;
+}
+
+/**
+ * Scan one file and return its report. Fails the call (ToolError) when the
+ * path is empty, missing, a directory, or not a Clojure file by the same
+ * gate as the hooks. Never writes.
+ */
+export function scanFile(opts: ScanOptions): string {
+  const p = opts.path.trim();
+  if (!p) {
+    throw new ToolError({ message: "clojure-scan requires a non-empty `path` string." });
+  }
+  const abs = path.resolve(opts.dir, p);
+  let content: string;
+  try {
+    content = readFileSync(abs, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") throw new ToolError({ message: `clojure-scan: no such file: ${abs}` });
+    if (code === "EISDIR") throw new ToolError({ message: `clojure-scan: ${abs} is a directory, not a file` });
+    throw new ToolError({ message: `clojure-scan: cannot read ${abs}: ${err instanceof Error ? err.message : String(err)}` });
+  }
+  if (!isClojureFile(abs, content)) {
+    throw new ToolError({
+      message: `clojure-scan: ${abs} is not a Clojure file (expected .clj, .cljs, .cljc, .cljd, .bb, .lpy, or .edn, or a bb shebang)`,
+    });
+  }
+  return scanReport(abs, content);
+}
+
+// ============================================================================
 // Patch op parsing
 // ============================================================================
 
@@ -1524,6 +1597,27 @@ export default Plugin.define({
             signal: context.signal,
           });
           return { content };
+        },
+      });
+      editor.add({
+        name: "clojure-scan",
+        description: `Check a Clojure file for delimiter errors: unmatched or mismatched () [] {}, unterminated strings or regexes. Use after you modify a .clj/.cljs/.cljc/.cljd/.bb/.lpy/.edn file with a shell command (sed, python, heredoc, ...) - the write/edit/patch tools are checked automatically, shell-mediated changes are not. Reports each error with line and column and shows the offending lines. Does not modify the file.`,
+        input: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "The Clojure file to check (absolute, or relative to the working directory)",
+            },
+          },
+          required: ["path"],
+          additionalProperties: false,
+        },
+        execute: async (input, context) => {
+          const args = (input ?? {}) as Record<string, unknown>;
+          return {
+            content: scanFile({ path: typeof args.path === "string" ? args.path : "", dir: await sessionDir(context.sessionID) }),
+          };
         },
       });
     });

@@ -13,6 +13,8 @@ import plugin, {
   hasDelimiterError,
   scanClojure,
   describeScanErrors,
+  scanReport,
+  scanFile,
   changedLinesBetween,
   repairSurgically,
   MAX_REPAIR_CHANGED_LINES,
@@ -1335,7 +1337,7 @@ test("evalClojure: server restart creates a fresh session", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// nREPL: tool registration via plugin setup
+// tool registration via plugin setup
 // ---------------------------------------------------------------------------
 
 test("setup: registers the clojure-nrepl-eval tool end-to-end", async () => {
@@ -1358,8 +1360,7 @@ test("setup: registers the clojure-nrepl-eval tool end-to-end", async () => {
   };
 
   const cleanup = await plugin.setup(ctx as never);
-  assert.equal(added.length, 1);
-  assert.equal(added[0].name, "clojure-nrepl-eval");
+  assert.deepEqual(added.map((tool) => tool.name), ["clojure-nrepl-eval", "clojure-scan"]);
 
   const result = await added[0].execute(
     { code: "(+ 1 2 3)" },
@@ -1400,4 +1401,133 @@ test("setup: empty code is rejected before connecting", async () => {
   );
   assert.equal(server.received.length, 0);
   if (typeof cleanup === "function") await cleanup();
+});
+
+test("setup: the clojure-scan tool reports a shell-mangled file end-to-end", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "cplr-setup-scan-"));
+  // what a sed or python edit can leave behind: a bindings vector that never
+  // closes
+  const broken = ["(defn f []", "  (let [x 1", "    (inc x)))"].join("\n");
+  writeFileSync(path.join(dir, "mangled.clj"), broken, "utf8");
+
+  const added: { name: string; execute: (input: unknown, context: unknown) => Promise<{ content: string }> }[] = [];
+  const ctx = {
+    location: { directory: dir },
+    session: { get: async () => ({ location: { directory: dir } }) },
+    tool: {
+      hook: async () => ({ dispose: async () => {} }),
+      transform: async (cb: (editor: { add: (tool: unknown) => void }) => void) => {
+        cb({ add: (tool) => added.push(tool as never) });
+        return { dispose: async () => {} };
+      },
+    },
+  };
+
+  const cleanup = await plugin.setup(ctx as never);
+  const scan = added.find((tool) => tool.name === "clojure-scan");
+  assert.ok(scan);
+
+  const context = { sessionID: "ses_test", signal: new AbortController().signal, progress: async () => {} };
+  const result = await scan.execute({ path: "mangled.clj" }, context);
+  assert.match(result.content, /2 delimiter errors:/);
+  assert.match(result.content, /does not match `\[` opened at line 2/);
+  assert.match(result.content, /L3:     \(inc x\)\)\)/);
+  assert.equal(readFileSync(path.join(dir, "mangled.clj"), "utf8"), broken, "the scanner never writes");
+
+  await assert.rejects(
+    () => scan.execute({ path: "   " }, context),
+    (err: unknown) => err instanceof ToolError && /non-empty/.test(err.message),
+  );
+  if (typeof cleanup === "function") await cleanup();
+});
+
+// ---------------------------------------------------------------------------
+// clojure-scan: scanReport / scanFile
+// ---------------------------------------------------------------------------
+
+test("scanReport: balanced content is a one-line verdict", () => {
+  assert.equal(scanReport("a.clj", "(def a 1)\n"), "a.clj: delimiters balanced");
+  assert.equal(scanReport("a.clj", ""), "a.clj: delimiters balanced");
+});
+
+test("scanReport: one error gets the singular header", () => {
+  assert.equal(
+    scanReport("a.clj", "(def x 1))\n"),
+    "a.clj: 1 delimiter error:\n  unexpected `)` at line 1:10\n  L1: (def x 1))",
+  );
+});
+
+test("scanReport: names each error and shows the offending lines", () => {
+  const broken = ["(defn f []", "  (let [x 1", "    (inc x)))"].join("\n");
+  assert.equal(
+    scanReport("a.clj", broken),
+    [
+      "a.clj: 2 delimiter errors:",
+      "  `)` at line 3:12 does not match `[` opened at line 2",
+      "  `(` opened at line 1 is never closed",
+      "  L1: (defn f []",
+      "  L3:     (inc x)))",
+    ].join("\n"),
+  );
+});
+
+test("scanReport: many errors and lines stay bounded", () => {
+  const broken = [...Array.from({ length: 12 }, (_, i) => `(inc ${i})`), ...Array.from({ length: 12 }, () => ")")].join(
+    "\n",
+  );
+  const report = scanReport("many.clj", broken);
+  assert.equal(report.split("\n").length, 1 + 6 + 1 + 6 + 1); // header + phrases + tail + lines + tail
+  assert.match(report, /^  \+6 more$/m);
+  assert.match(report, /^  \+6 more lines$/m);
+  assert.match(report, /unexpected `\)` at line 13:1/);
+});
+
+test("scanReport: long offending lines are truncated with a marker", () => {
+  const broken = ["(defn f []", "  (inc " + "x".repeat(200)].join("\n");
+  const lines = scanReport("a.clj", broken).split("\n");
+  assert.equal(lines.length, 1 + 2 + 2); // header + 2 phrases + 2 lines
+  assert.match(lines[4], /^  L2: .{120}…$/);
+});
+
+test("scanFile: relative and absolute paths report the same file", () => {
+  writeFileSync(path.join(tmp, "scan-a.clj"), "(def a 1)\n", "utf8");
+  const abs = path.join(tmp, "scan-a.clj");
+  assert.equal(scanFile({ path: "scan-a.clj", dir: tmp }), `${abs}: delimiters balanced`);
+  assert.equal(scanFile({ path: abs, dir: tmp }), `${abs}: delimiters balanced`);
+});
+
+test("scanFile: a broken file reports the errors and is left byte for byte", () => {
+  const broken = ["(defn f []", "  (let [x 1", "    (inc x)))"].join("\n");
+  const file = path.join(tmp, "scan-b.clj");
+  writeFileSync(file, broken, "utf8");
+  const report = scanFile({ path: "scan-b.clj", dir: tmp });
+  assert.match(report, /2 delimiter errors:/);
+  assert.match(report, /does not match `\[` opened at line 2/);
+  assert.equal(readFileSync(file, "utf8"), broken);
+});
+
+test("scanFile: empty, missing and directory paths fail with ToolError", () => {
+  assert.throws(
+    () => scanFile({ path: "  ", dir: tmp }),
+    (err) => err instanceof ToolError && /non-empty/.test(err.message),
+  );
+  assert.throws(
+    () => scanFile({ path: "ghost.clj", dir: tmp }),
+    (err) => err instanceof ToolError && /no such file/.test(err.message),
+  );
+  assert.throws(
+    () => scanFile({ path: ".", dir: tmp }),
+    (err) => err instanceof ToolError && /is a directory/.test(err.message),
+  );
+});
+
+test("scanFile: non-Clojure files are refused by the same gate as the hooks", () => {
+  writeFileSync(path.join(tmp, "scan-c.py"), "print(1)\n", "utf8");
+  assert.throws(
+    () => scanFile({ path: "scan-c.py", dir: tmp }),
+    (err) => err instanceof ToolError && /not a Clojure file/.test(err.message),
+  );
+  // an extensionless file with a bb shebang is accepted and scanned
+  writeFileSync(path.join(tmp, "scan-d"), "#!/usr/bin/env bb\n(def d 1\n", "utf8");
+  assert.match(scanFile({ path: "scan-d", dir: tmp }), /never closed/);
 });

@@ -2,8 +2,10 @@
 
 [OpenCode](https://opencode.ai) v2 plugin for Clojure development:
 auto-repairs Clojure delimiter errors when the model writes or edits
-Clojure files (zero extra LLM tokens), and exposes a `clojure-nrepl-eval`
-tool that evaluates code against the project's nREPL server. It is
+Clojure files (zero extra LLM tokens), exposes a `clojure-scan` tool that
+reports the delimiter errors of a file the hooks did not see (for example
+one a shell command changed), and a `clojure-nrepl-eval` tool that evaluates
+code against the project's nREPL server. It is
 self-contained: delimiter repair runs in-process through the
 [parinfer](https://www.npmjs.com/package/parinfer) npm package
 (`indentMode` — Parinfer's indent mode), the nREPL client (bencode wire
@@ -78,6 +80,27 @@ any exception with a truncated trace. Evaluation errors (an exception thrown
 by the code) are returned as normal results so the model can read them;
 operational failures (no port, connection refused, timeout, delimiter errors
 the repair will not touch) fail the tool call with a `Tool.Error`.
+
+## File scanning
+
+The plugin registers a `clojure-scan` tool so the model can check a file the
+automatic hooks did not see — typically a Clojure file changed by a shell
+command (`sed`, Python, a heredoc), which bypasses the `write`/`edit`/`patch`
+repair:
+
+- **Read-only.** The tool reports; it never repairs and never writes. Fix the
+  delimiters (an `edit` gets the usual auto-repair) and scan again.
+- **Actionable report.** Each error is named with its line and column by the
+  same scanner that gates the hooks (`` `)` at line 51:39 does not match
+  `[` opened at line 34 ``), followed by the offending lines numbered, so the
+  model fixes the file without re-reading it. A balanced file gets a
+  one-line `delimiters balanced` verdict. Error phrases and displayed lines
+  are capped (six each, with a `+N more` tail).
+- **Same file gate as the hooks.** `.clj`, `.cljs`, `.cljc`, `.cljd`, `.bb`,
+  `.lpy`, `.edn` (case-insensitive) or a `#!/.../bb` shebang; anything else —
+  and missing paths and directories — is refused with an error.
+
+Input: `{ path }` (absolute, or relative to the session's working directory).
 
 ## Requirements
 
