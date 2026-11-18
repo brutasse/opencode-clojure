@@ -27,15 +27,20 @@ Details:
   literals, line comments, regex literals, delimiter stack) reports where the
   delimiters go wrong, and the repair engine only runs when they actually are
   unbalanced.
-- **Repairs stay next to the error.** A repair proposal is accepted only when it
-  rewrites at most two lines, each within five lines above or thirty below a
-  reported error or the lines your change made. Anything wider is refused and
-  your text is kept, with the error's line in the message. Parinfer's indent mode
+- **Repairs stay next to the error - or add a missing closer where the form
+  ends.** A repair proposal is accepted only while it is surgical: when the
+  only errors are unclosed openers, it must add nothing but the missing
+  closers, each inside the form it closes - the closer sits any distance below
+  the opener, so no distance band bounds it; any other error keeps a band, at
+  most two lines, each within five above or thirty below a reported error or
+  the lines your change made (asymmetric, because the damage pattern - closing
+  a form early where the indentation suggests it ends - always reaches above
+  the error). Anything wider, or any proposal that moves or deletes existing
+  delimiters, is refused and your text is kept, with the error's line in the
+  message. Parinfer's indent mode
   reads indentation as the truth, so in a file whose indentation does not match
   its delimiters one missing closer made it move delimiters on up to 58 lines,
-  and the mangled file still parsed. The band is asymmetric because a missing
-  closer is reported at its opener and inserted at the end of that form, often
-  tens of lines lower, while closing a form early always reaches above the error.
+  and the mangled file still parsed.
   Measured on a Clojure codebase with one closer removed per file: 90 of 108
   damaged files were repaired, each one restoring exactly the delimiters the
   author wrote, and none moved a delimiter the author had not misplaced.
